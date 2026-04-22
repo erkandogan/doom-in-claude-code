@@ -1,0 +1,13 @@
+node_modules/
+dist/
+build/
+*.o
+*.a
+src/daemon/doomgeneric/
+src/daemon/doomd
+assets/*.wad
+assets/freedoom-*/
+!assets/.gitkeep
+.savegame/
+.DS_Store
+.claude/

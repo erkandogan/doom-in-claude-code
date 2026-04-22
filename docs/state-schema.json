@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "doom-in-claude state.json",
+  "description": "Snapshot of the current Doom game state, written by the daemon after each tick. Backends must emit at least `backend`, `tick`, and `hp`.",
+  "type": "object",
+  "required": ["backend", "tick"],
+  "properties": {
+    "backend":       { "type": "string", "enum": ["stub", "doomgeneric"] },
+    "tick":          { "type": "integer", "minimum": 0 },
+    "level":         { "type": "string" },
+    "hp":            { "type": "integer" },
+    "armor":         { "type": "integer" },
+    "weapon":        { "type": "string" },
+    "weapons_owned": { "type": "array", "items": { "type": "string" } },
+    "ammo": {
+      "type": "object",
+      "properties": {
+        "bullets": { "type": "integer" },
+        "shells":  { "type": "integer" },
+        "rockets": { "type": "integer" },
+        "cells":   { "type": "integer" }
+      }
+    },
+    "player": {
+      "type": "object",
+      "properties": {
+        "x":      { "type": "number" },
+        "y":      { "type": "number" },
+        "facing": { "type": "string" }
+      }
+    },
+    "enemies_alive": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind":     { "type": "string" },
+          "x":        { "type": "number" },
+          "y":        { "type": "number" },
+          "hp":       { "type": "integer" },
+          "bearing":  { "type": "string" },
+          "distance": { "type": "number" }
+        }
+      }
+    },
+    "items_visible": { "type": "array" },
+    "last_message":  { "type": "string" },
+    "messages":      { "type": "array", "items": { "type": "string" } }
+  }
+}

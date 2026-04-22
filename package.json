@@ -1,0 +1,43 @@
+{
+  "name": "doom-in-claude",
+  "version": "0.1.0",
+  "description": "Play Doom inside Claude Code. Real game engine rendering to the status line, chat-box keyboard input, and an MCP server so Claude can play too.",
+  "bin": {
+    "doom-in-claude": "./bin/doom-in-claude",
+    "dic": "./bin/doom-in-claude"
+  },
+  "scripts": {
+    "install-to-claude": "./install.sh",
+    "uninstall": "./install.sh --uninstall",
+    "start": "./bin/doom-in-claude start",
+    "stop": "./bin/doom-in-claude stop",
+    "status": "./bin/doom-in-claude status",
+    "mcp": "node src/mcp/server.js",
+    "stub": "node src/stub/daemon.js"
+  },
+  "keywords": [
+    "claude-code",
+    "doom",
+    "mcp",
+    "status-line",
+    "hook",
+    "slash-command"
+  ],
+  "author": "doom-in-claude contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "scripts/",
+    "assets/",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ]
+}

@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# doom-in-claude CLI — controls the Doom daemon.
+#
+# Resolves its own repo root so it works whether called from a clone or
+# from the symlink install.sh drops into ~/.local/bin.
+
+set -u
+
+# ─── Locate repo root ────────────────────────────────────────────────────
+
+RESOLVED="$0"
+while [ -L "$RESOLVED" ]; do
+  LINK="$(readlink "$RESOLVED")"
+  case "$LINK" in
+    /*) RESOLVED="$LINK" ;;
+    *)  RESOLVED="$(cd "$(dirname "$RESOLVED")" && pwd)/$LINK" ;;
+  esac
+done
+REPO_ROOT="$(cd "$(dirname "$RESOLVED")/.." && pwd)"
+
+STATE_DIR="${DIC_STATE_DIR:-/tmp/doom-in-claude}"
+FIFO="$STATE_DIR/input.fifo"
+FRAME_ANSI="$STATE_DIR/frame.ansi"
+FRAME_TXT="$STATE_DIR/frame.txt"
+STATE_JSON="$STATE_DIR/state.json"
+PID_FILE="$STATE_DIR/daemon.pid"
+LOG_FILE="$STATE_DIR/daemon.log"
+
+STUB_DAEMON="$REPO_ROOT/src/stub/daemon.js"
+REAL_DAEMON="$REPO_ROOT/src/daemon/doomd"
+
+ensure_state_dir() {
+  mkdir -p "$STATE_DIR"
+  [ -p "$FIFO" ] || mkfifo "$FIFO" 2>/dev/null || true
+}
+
+daemon_alive() {
+  [ -f "$PID_FILE" ] || return 1
+  local pid
+  pid=$(cat "$PID_FILE" 2>/dev/null) || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+# ─── Commands ────────────────────────────────────────────────────────────
+
+cmd_start() {
+  local backend="" wad="" cols="" rows="" render="" chafa_opts="" sixel_w="" sixel_h="" preset="" blocks_colors="" gamma=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --backend)       backend="$2";       shift 2 ;;
+      --wad)           wad="$2";           shift 2 ;;
+      --cols)          cols="$2";          shift 2 ;;
+      --rows)          rows="$2";          shift 2 ;;
+      --render)        render="$2";        shift 2 ;;
+      --chafa-opts)    chafa_opts="$2";    shift 2 ;;
+      --chafa-preset)  preset="$2";        shift 2 ;;
+      --blocks-colors) blocks_colors="$2"; shift 2 ;;
+      --gamma)         gamma="$2";         shift 2 ;;
+      --sixel-w)       sixel_w="$2";       shift 2 ;;
+      --sixel-h)       sixel_h="$2";       shift 2 ;;
+      *) echo "Unknown arg: $1" >&2; return 2 ;;
+    esac
+  done
+
+  # Named chafa presets. --chafa-opts overrides a preset if both given.
+  # "Safe" set: Unicode 1.1 block glyphs only (quadrant + block + half).
+  # Every string-width library handles these correctly, so Ink's diff
+  # column counter stays in sync frame after frame — no accumulating
+  # drift / corruption that requires restarting Claude Code to reset.
+  local SAFE_SYMBOLS="quad+block+vhalf+hhalf"
+  # "Pretty" set adds Unicode 13 sextants for finer detail. Higher
+  # fidelity on first frame but Ink may drift over many frames.
+  local PRETTY_SYMBOLS="sextant+quad+block+vhalf+hhalf"
+  if [ -n "$preset" ] && [ -z "$chafa_opts" ]; then
+    case "$preset" in
+      # Numbered historical iterations. Test in order.
+      v1)
+        chafa_opts="--symbols sextant --format symbols --colors full --fg-only --dither diffusion" ;;
+      v2)
+        chafa_opts="--symbols sextant --format symbols --colors full --dither diffusion" ;;
+      v3)
+        chafa_opts="--symbols sextant --format symbols --colors full --dither none --work 3" ;;
+      v4)
+        chafa_opts="--symbols $SAFE_SYMBOLS --format symbols --colors full --dither diffusion --work 9 --color-extractor median --color-space din99d" ;;
+      v5)
+        chafa_opts="--symbols $SAFE_SYMBOLS --format symbols --colors full --dither ordered --dither-grain 4x4 --work 9 --color-extractor median --color-space din99d --optimize 9 --preprocess on" ;;
+      v6)
+        chafa_opts="--symbols $SAFE_SYMBOLS --fill space+stipple --format symbols --colors 256 --dither ordered --dither-grain 4x4 --work 9 --color-extractor median --color-space din99d --optimize 9 --preprocess on" ;;
+
+      default|balanced|hq|smooth)
+        # The balanced preset: 256-palette + ordered 4×4 dither + din99d
+        # color space. ~Half the per-cell SGR bytes of TrueColor (~16B
+        # vs ~32B per cell), cutting Ink's diff-engine pressure by half.
+        # Ordered dithering gives a predictable checkerboard pattern
+        # that doesn't "crawl" frame-to-frame like diffusion dither.
+        # din99d color-space picks perceptually-closest palette entries,
+        # so Doom's muted browns/reds map to visually-acceptable
+        # approximations instead of garish generic palette reds.
+        # Combined with CLAUDE_CODE_TMUX_TRUECOLOR=1 at the shell level
+        # (which restores TrueColor for Claude Code's own UI), this is
+        # the sweet spot: vivid Claude UI + manageable DOOM drift.
+        chafa_opts="--symbols $SAFE_SYMBOLS --format symbols --colors 256 --dither ordered --dither-grain 4x4 --work 9 --color-extractor median --color-space din99d --optimize 0" ;;
+      vivid)
+        # TrueColor DOOM output. Matches Doom's palette exactly but
+        # doubles per-cell SGR bytes — Ink's diff drifts under heavy
+        # damage-flash / fireball / whole-scene-color-change events.
+        # Best colors if you can tolerate occasional corruption.
+        chafa_opts="--symbols $SAFE_SYMBOLS --format symbols --colors full --dither diffusion --work 9 --color-extractor median --color-space din99d --optimize 0" ;;
+      rich)
+        # Middle ground between `default` (256+ordered) and `vivid`
+        # (full+diffusion). TrueColor SGR format so chafa has the whole
+        # 24-bit gamut to pick from, but ordered 4×4 dither keeps the
+        # frame-to-frame noise pattern predictable (not "crawling" like
+        # diffusion). Doom's own PPM is already quantized to 4-bit per
+        # channel (4096 colors), so in practice this emits from a 4096-
+        # color palette inside TrueColor SGR — noticeably more color
+        # gamut than 256-xterm's 6-levels-per-channel cube, while still
+        # allowing Ink's diff to cope. Drift is in between: rare, not
+        # never. If damage flashes still cause drift, drop to default.
+        chafa_opts="--symbols $SAFE_SYMBOLS --format symbols --colors full --dither ordered --dither-grain 4x4 --work 9 --color-extractor median --color-space din99d --optimize 0" ;;
+      detailed)
+        # 256-palette (same byte budget as default — drift-safe) but
+        # tuned for maximum perceptual quality:
+        #   --preprocess on       applies gamma + saturation pre-adjust
+        #                         before quantization — punches contrast
+        #                         so muted browns separate from blacks
+        #                         and avoid all-mapping to the same
+        #                         "dark cube cell"
+        #   --dither-grain 2x2    finer dither pattern than 4x4; tiny
+        #                         cost in frame-to-frame variance but
+        #                         resolves more subtle gradients
+        #   --color-extractor average  average colors across cell area;
+        #                         less edgy than median but smoother
+        #                         on Doom's gradient walls
+        # Pair with --cols 160 --rows 32 (or higher) for full effect —
+        # more cells means each cell averages fewer source pixels,
+        # so the palette-mapping quality improvements are visible.
+        # Note: chafa only supports rgb / din99d color spaces (no cielab),
+        # and din99d is already the perceptual one.
+        chafa_opts="--symbols $SAFE_SYMBOLS --format symbols --colors 256 --dither ordered --dither-grain 2x2 --work 9 --color-extractor average --color-space din99d --optimize 0 --preprocess on" ;;
+      sextant-tmux)
+        # Unicode 13 sextant glyphs (U+1FB00..U+1FB3B) give 2×3 subpixels
+        # per cell vs quadrant's 2×2 — 50% more vertical detail at the
+        # same SGR byte cost. Outside tmux this causes Ink's cell-width
+        # tracking to drift because string-width can't reliably measure
+        # the Unicode 13 glyphs. Under tmux (3.2+) the grid parser
+        # absorbs the drift. Use ONLY if your Claude Code session is
+        # inside tmux and you've confirmed tmux 3.2+ wcwidth support.
+        chafa_opts="--symbols $PRETTY_SYMBOLS --format symbols --colors 256 --dither ordered --dither-grain 4x4 --work 9 --color-extractor median --color-space din99d --optimize 0" ;;
+      pretty)
+        # Sextant-enabled for first-frame detail; may accumulate corruption
+        # over long play sessions (see v4 notes).
+        chafa_opts="--symbols $PRETTY_SYMBOLS --format symbols --colors full --dither diffusion --work 9 --color-extractor median --color-space din99d --optimize 9" ;;
+      stable)
+        # 256-color with ordered dither — essentially the same as
+        # `default` but kept as a distinct name for historical tests.
+        chafa_opts="--symbols $SAFE_SYMBOLS --format symbols --colors 256 --dither ordered --dither-grain 4x4 --work 9 --color-extractor median --color-space din99d --optimize 0" ;;
+      sharp)
+        chafa_opts="--symbols $SAFE_SYMBOLS --format symbols --colors 256 --dither none --work 9" ;;
+      fast)
+        chafa_opts="--symbols $SAFE_SYMBOLS --format symbols --colors 256 --dither none --work 3" ;;
+      broad)
+        chafa_opts="--symbols all --format symbols --colors full --dither diffusion --work 9 --color-extractor median --color-space din99d" ;;
+      sixel)
+        chafa_opts="-f sixel --symbols $SAFE_SYMBOLS --colors full --dither diffusion --work 9" ;;
+      kitty)
+        chafa_opts="-f kitty --colors full --dither diffusion --work 9" ;;
+      *)
+        echo "Unknown --chafa-preset: $preset. Try: default (=balanced), detailed, sextant-tmux, rich, vivid, stable, sharp, fast, pretty, broad, sixel, kitty, or v1..v6 (historical)" >&2
+        return 2 ;;
+    esac
+  fi
+
+  [ -n "$cols"          ] && export DIC_COLS="$cols"
+  [ -n "$rows"          ] && export DIC_ROWS="$rows"
+  [ -n "$blocks_colors" ] && export DIC_BLOCKS_COLORS="$blocks_colors"
+  [ -n "$gamma"         ] && export DIC_GAMMA="$gamma"
+  [ -n "$render"     ] && export DIC_RENDER="$render"
+  [ -n "$chafa_opts" ] && export CHAFA_OPTS="$chafa_opts"
+  [ -n "$sixel_w"    ] && export DIC_SIXEL_W="$sixel_w"
+  [ -n "$sixel_h"    ] && export DIC_SIXEL_H="$sixel_h"
+
+  # Auto-pick backend: real Doom if the binary is present, else stub.
+  if [ -z "$backend" ]; then
+    if [ -x "$REAL_DAEMON" ]; then backend="doomgeneric"; else backend="stub"; fi
+  fi
+
+  ensure_state_dir
+
+  if daemon_alive; then
+    echo "Daemon already running (pid $(cat "$PID_FILE"))."
+    return 0
+  fi
+
+  # Fresh state files.
+  rm -f "$FRAME_ANSI" "$FRAME_TXT" "$STATE_JSON" "$LOG_FILE"
+
+  case "$backend" in
+    stub)
+      if ! command -v node >/dev/null 2>&1; then
+        echo "Error: node not found on PATH. Install Node.js >= 18." >&2
+        return 1
+      fi
+      nohup node "$STUB_DAEMON" >>"$LOG_FILE" 2>&1 &
+      echo "Started stub daemon (pid $!)."
+      ;;
+    doomgeneric)
+      if [ ! -x "$REAL_DAEMON" ]; then
+        echo "doomgeneric backend not built. Run: (cd $REPO_ROOT/src/daemon && make)" >&2
+        echo "Falling back to stub backend." >&2
+        nohup node "$STUB_DAEMON" >>"$LOG_FILE" 2>&1 &
+        echo "Started stub daemon (pid $!)."
+      else
+        if [ -z "$wad" ]; then
+          wad="$REPO_ROOT/assets/freedoom1.wad"
+        fi
+        if [ ! -f "$wad" ]; then
+          echo "WAD not found: $wad" >&2
+          echo "Hint: download Freedoom with: $REPO_ROOT/scripts/fetch-freedoom.sh" >&2
+          return 1
+        fi
+        # -warp jumps straight into E1M1 so the user doesn't have to
+        # navigate title screens via repeated Enter presses.
+        nohup "$REAL_DAEMON" -iwad "$wad" -warp 1 1 >>"$LOG_FILE" 2>&1 &
+        echo "Started doomgeneric daemon (pid $!)."
+      fi
+      ;;
+    *)
+      echo "Unknown backend: $backend (expected stub|doomgeneric)" >&2
+      return 2
+      ;;
+  esac
+}
+
+cmd_stop() {
+  if ! daemon_alive; then
+    echo "Daemon is not running."
+    rm -f "$PID_FILE"
+    return 0
+  fi
+  local pid
+  pid=$(cat "$PID_FILE")
+  kill -TERM "$pid" 2>/dev/null || true
+  for i in 1 2 3 4 5; do
+    daemon_alive || break
+    sleep 0.2
+  done
+  if daemon_alive; then
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+  echo "Daemon stopped."
+}
+
+cmd_status() {
+  if daemon_alive; then
+    echo "running (pid $(cat "$PID_FILE"))"
+    [ -f "$STATE_JSON" ] && command -v jq >/dev/null 2>&1 && {
+      echo "---"
+      jq -r '"HP: \(.hp)  ARM: \(.armor)  WPN: \(.weapon)  TICK: \(.tick)"' "$STATE_JSON" 2>/dev/null || true
+    }
+  else
+    echo "stopped"
+  fi
+}
+
+cmd_send() {
+  if ! daemon_alive; then
+    echo "Daemon is not running. Start it with: doom-in-claude start" >&2
+    return 1
+  fi
+  printf '%s\n' "$*" >"$FIFO"
+}
+
+cmd_frame() {
+  if [ -f "$FRAME_ANSI" ]; then
+    cat "$FRAME_ANSI"
+  else
+    echo "(no frame yet)"
+  fi
+}
+
+cmd_help() {
+  cat <<'EOF'
+doom-in-claude — control Doom inside Claude Code.
+
+Usage:
+  doom-in-claude start [--backend stub|doomgeneric] [--wad PATH]
+                       [--render MODE] [--chafa-preset NAME]
+                       [--blocks-colors 256|full] [--cols N] [--rows N]
+  doom-in-claude stop
+  doom-in-claude status
+  doom-in-claude send KEYS        # forward raw keys to the daemon
+  doom-in-claude frame            # print the current frame to stdout
+  doom-in-claude install          # run install.sh
+  doom-in-claude --help
+
+Render modes (--render):
+  chafa            default — external chafa binary (auto if installed)
+  blocks-hq        native C renderer, area-averaged colors, safe glyphs
+  timg             external timg binary (brew install timg)
+  quadrant         native point-sampled blocks (simpler, less smooth)
+  sextant          Unicode 13 sextants (drift risk outside tmux)
+  sixel / kitty    image protocols (confirmed blocked by Claude Code Ink)
+
+Chafa presets (--chafa-preset) — used with --render chafa:
+  default/balanced 256-palette + ordered dither (the drift-safe default)
+  detailed         256 + cielab + preprocess (better 256 quality; pair with
+                   --cols 160 --rows 32 for full effect)
+  sextant-tmux     256 + U+1FB00 sextant glyphs (2×3 subpixels per cell,
+                   50% more density; REQUIRES tmux)
+  rich             TrueColor + ordered dither (4096 actual colors, moderate drift)
+  vivid            TrueColor + diffusion dither (best colors, heavy drift)
+  stable           alias for default
+  sharp            no dither, flat colors
+  fast             no dither, lower CPU
+  pretty           Unicode 13 sextants (drift outside tmux)
+  broad            all chafa symbols
+
+Blocks-hq color depth (--blocks-colors):
+  full             TrueColor output (default, higher fidelity)
+  256              xterm-256 palette (smallest byte stream, best drift resistance)
+
+Gamma (--gamma VALUE):
+  Applies a gamma curve to pixels before quantization. Values < 1.0
+  brighten midtones — useful for Doom's dark scenes whose shadow detail
+  otherwise collapses into a single black palette entry.
+  Default: 1.0 (off). Recommended: 0.6-0.8 for 256-palette, 0.8-1.0 for TrueColor.
+  Example: /doom start --gamma 0.7
+
+Recommended setup:
+  1. Run Claude Code inside tmux (tmux absorbs Ink's render drift)
+  2. Add to ~/.zshrc: export CLAUDE_CODE_TMUX_TRUECOLOR=1
+  3. /doom start  (no args — uses the balanced 256-color chafa default)
+
+Once running, type Doom input directly in the Claude Code chat:
+  w a s d         move / strafe
+  q e             turn left / right
+  f               fire
+  u or space      use
+  1-7             switch weapon
+  wwwf            compound: 3 forward + fire
+  go 10           let 10 ticks elapse with no input
+  wait            one idle tick
+EOF
+}
+
+cmd_from_slash() {
+  # Called by the /doom slash command. Output is read by Claude at prompt
+  # expansion time, so keep it short and user-friendly.
+  local sub="${1:-status}"
+  shift || true
+  case "$sub" in
+    ""|status) cmd_status ;;
+    start)     cmd_start "$@" ;;
+    stop)      cmd_stop ;;
+    look|frame) cmd_frame ;;
+    help)      cmd_help ;;
+    *)
+      echo "Unknown /doom subcommand: $sub"
+      echo "Try: /doom start | /doom stop | /doom status | /doom look | /doom help"
+      ;;
+  esac
+}
+
+# ─── Dispatch ────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+  start)        shift; cmd_start "$@" ;;
+  stop)         cmd_stop ;;
+  status)       cmd_status ;;
+  send)         shift; cmd_send "$@" ;;
+  frame|look)   cmd_frame ;;
+  install)      "$REPO_ROOT/install.sh" ;;
+  uninstall)    "$REPO_ROOT/install.sh" --uninstall ;;
+  --from-slash) shift; cmd_from_slash "$@" ;;
+  --help|-h|help) cmd_help ;;
+  *)            echo "Unknown command: $1"; cmd_help; exit 2 ;;
+esac
