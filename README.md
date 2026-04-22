@@ -76,15 +76,24 @@ The installer:
 
 Uninstall with `./install.sh --uninstall`.
 
-## Recommended setup (important)
+## Recommended setup
 
-Claude Code's Ink-based renderer drifts under the byte volume of a live Doom frame. After extensive debugging (details in `docs/`), the drift-free setup is:
+The default install gives you a playable Doom that's stable for most play sessions. A few tweaks make it *more* stable and more legible. None are strictly required.
 
-### 1. Run Claude Code inside tmux
+### 1. Recommended play command
 
-tmux absorbs Ink's cell-diff drift by re-parsing output into its own terminal-state model. Without tmux, the statusline corrupts after heavy scene changes and only a full Claude Code restart clears it. With tmux, it stays stable indefinitely.
+```
+/doom start --gamma 0.7
+```
 
-Your `~/.tmux.conf` should include:
+- **Default renderer**: chafa with 256-color palette + ordered dither — half the per-cell SGR byte cost of TrueColor, drift-resistant under heavy scene changes (damage flashes, fireballs). This is the main drift mitigation and it's on by default.
+- **`--gamma 0.7`**: lifts Doom's dark corridor values out of the single "black cube entry" so walls and textures are legible. Without it, dark rooms can collapse to monochrome. Range 0.5–1.0, 0.7 is the sweet spot.
+
+### 2. Optional: run Claude Code inside tmux for bulletproof stability
+
+Claude Code's Ink-based renderer maintains an internal cell-diff cache that can occasionally drift under heavy scene changes (big damage flashes, sudden full-screen color swaps). The default renderer's byte-stability + static anchor border + lower frame rate keep this rare. If you want it **impossible**, run Claude Code inside tmux — tmux re-parses ANSI into its own canonical grid and re-emits cleanly, absorbing any drift from Ink.
+
+Your `~/.tmux.conf`:
 
 ```tmux
 set -g default-terminal "tmux-256color"
@@ -97,27 +106,18 @@ set -sa terminal-features ",*:RGB"
 set-environment -g COLORTERM "truecolor"
 ```
 
-### 2. Restore TrueColor for Claude Code's UI inside tmux
+### 3. If you go tmux: restore TrueColor for Claude Code's UI
 
-Claude Code has an (undocumented but functional) defensive clamp to 256-color when `$TMUX` is set. Disable it:
+Claude Code has a defensive clamp to 256-color when `$TMUX` is set. Without the following, Claude's own TUI colors look muted inside tmux:
 
 ```bash
 # Add to ~/.zshrc (or ~/.bashrc)
 export CLAUDE_CODE_TMUX_TRUECOLOR=1
 ```
 
-This restores TrueColor for Claude's OWN TUI. The Doom frame renders in 256-palette regardless (see below) — that's intentional for stability — but Claude's prompt / diff / syntax highlighting use the full gamut.
+This restores TrueColor for Claude's TUI. The Doom frame still renders in 256-palette regardless (that's intentional for drift resistance), but Claude's prompt / diff / syntax highlighting use the full gamut.
 
 See [anthropics/claude-code#46146](https://github.com/anthropics/claude-code/issues/46146) for the env var reference.
-
-### 3. Recommended play command
-
-```
-/doom start --gamma 0.7
-```
-
-- **Default renderer**: chafa with 256-color palette + ordered dither — half the per-cell SGR byte cost of TrueColor, drift-resistant under heavy scene changes (damage flashes, fireballs).
-- **`--gamma 0.7`**: lifts Doom's dark corridor values out of the single "black cube entry" so walls and textures are legible. Without it, dark rooms collapse to monochrome. Range 0.5–1.0, 0.7 is the sweet spot.
 
 ## Usage
 
@@ -216,7 +216,7 @@ Zero byte-count cost — the LUT is per-pixel, not per-frame. Drift risk unchang
 - **Turn-based cadence.** One Enter press per decision. You can't hold W to run — you type `www` + Enter. Use `go N` to auto-tick.
 - **Passive refresh at 3.3 Hz.** The daemon writes a new frame every 300 ms; the statusline reads on refresh + events.
 - **~28 rows × 120 cols** of frame at default size, tunable via `--cols`/`--rows`.
-- **Claude Code's Ink renderer drifts without tmux.** The extensive internal mitigations (byte-stable cells, static black border, fixed-width HUD) slow drift but don't eliminate it outside tmux. tmux is the structural fix.
+- **Residual drift is possible under extreme scene changes.** The internal mitigations (byte-stable cells, static black border, 256-palette default, fixed-width HUD) keep drift rare in normal play. If you want it *impossible*, run Claude Code inside tmux — tmux's grid-repair absorbs any remaining drift.
 - **MCP screenshots cost tokens.** `doom_look` returns a PNG (~1–2k tokens). Use `doom_state` first, `doom_look` when stuck.
 
 ## Why this architecture
